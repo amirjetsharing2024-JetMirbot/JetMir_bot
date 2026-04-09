@@ -114,6 +114,80 @@ async def collect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              1 if media_type else 0, media_type, ts)
         )
 
+# ── Text builders (используются и командами и кнопками) ──────────────────────
+def get_stats_text() -> str:
+    with get_conn() as conn:
+        total  = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        chats  = conn.execute("SELECT COUNT(DISTINCT chat_id) FROM messages").fetchone()[0]
+        users  = conn.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE user_id IS NOT NULL").fetchone()[0]
+        media  = conn.execute("SELECT COUNT(*) FROM messages WHERE has_media=1").fetchone()[0]
+        today_start = int(datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+        today  = conn.execute("SELECT COUNT(*) FROM messages WHERE date>=?", (today_start,)).fetchone()[0]
+        oldest = conn.execute("SELECT MIN(date) FROM messages").fetchone()[0]
+        newest = conn.execute("SELECT MAX(date) FROM messages").fetchone()[0]
+    oldest_s = ts_to_local(oldest) if oldest else "—"
+    newest_s = ts_to_local(newest) if newest else "—"
+    return (
+        f"📊 *Общая статистика*\n\n"
+        f"Всего сообщений: `{total:,}`\n"
+        f"Из них сегодня:  `{today:,}`\n"
+        f"С медиафайлом:   `{media:,}`\n"
+        f"Чатов:           `{chats}`\n"
+        f"Уникальных юзеров: `{users}`\n\n"
+        f"Первое сообщение: `{oldest_s}`\n"
+        f"Последнее:        `{newest_s}`"
+    )
+
+def get_chats_text() -> str:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT chat_id, chat_title, COUNT(*) as cnt, MAX(date) as last
+               FROM messages GROUP BY chat_id ORDER BY cnt DESC"""
+        ).fetchall()
+    if not rows:
+        return "Нет данных. Добавь бота в чаты."
+    lines = ["💬 *Отслеживаемые чаты*\n"]
+    for r in rows:
+        title = r["chat_title"] or "—"
+        last  = ts_to_local(r["last"]) if r["last"] else "—"
+        lines.append(f"*{title}*\n  ID: `{r['chat_id']}`\n  Сообщений: `{r['cnt']:,}` | Последнее: `{last}`")
+    return "\n\n".join(lines)
+
+def get_topusers_text(n: int = 10) -> str:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT user_id, username, full_name, COUNT(*) as cnt,
+                       COUNT(DISTINCT chat_id) as chats
+                FROM messages WHERE user_id IS NOT NULL
+                GROUP BY user_id ORDER BY cnt DESC LIMIT {n}"""
+        ).fetchall()
+    if not rows:
+        return "Нет данных."
+    lines = [f"🏆 *Топ {n} активных участников*\n"]
+    for i, r in enumerate(rows, 1):
+        name  = r["full_name"] or r["username"] or str(r["user_id"])
+        uname = f"@{r['username']}" if r["username"] else f"`{r['user_id']}`"
+        lines.append(f"{i}. {name} ({uname})\n   Сообщений: `{r['cnt']:,}` в `{r['chats']}` чатах")
+    return "\n\n".join(lines)
+
+def get_recent_text(n: int = 20) -> str:
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT chat_title, full_name, username, text, media_type, date
+                FROM messages ORDER BY date DESC LIMIT {n}"""
+        ).fetchall()
+    if not rows:
+        return "Нет сообщений."
+    lines = [f"🕐 *Последние {n} сообщений*\n"]
+    for r in rows:
+        who  = r["full_name"] or r["username"] or "?"
+        chat = r["chat_title"] or "?"
+        ts   = ts_to_local(r["date"])
+        body = r["text"] or f"[{r['media_type'] or 'медиа'}]"
+        body = body[:120] + ("…" if len(body) > 120 else "")
+        lines.append(f"`{ts}` [{chat}] *{who}*:\n{body}")
+    return "\n\n".join(lines)
+
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -156,125 +230,32 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private": return
     if not is_admin(update): return await deny(update)
-
-    with get_conn() as conn:
-        total   = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        chats   = conn.execute("SELECT COUNT(DISTINCT chat_id) FROM messages").fetchone()[0]
-        users   = conn.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE user_id IS NOT NULL").fetchone()[0]
-        media   = conn.execute("SELECT COUNT(*) FROM messages WHERE has_media=1").fetchone()[0]
-        today_start = int(datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
-        today   = conn.execute("SELECT COUNT(*) FROM messages WHERE date>=?", (today_start,)).fetchone()[0]
-        oldest  = conn.execute("SELECT MIN(date) FROM messages").fetchone()[0]
-        newest  = conn.execute("SELECT MAX(date) FROM messages").fetchone()[0]
-
-    oldest_s = ts_to_local(oldest) if oldest else "—"
-    newest_s = ts_to_local(newest) if newest else "—"
-
-    text = (
-        f"📊 *Общая статистика*\n\n"
-        f"Всего сообщений: `{total:,}`\n"
-        f"Из них сегодня:  `{today:,}`\n"
-        f"С медиафайлом:   `{media:,}`\n"
-        f"Чатов:           `{chats}`\n"
-        f"Уникальных юзеров: `{users}`\n\n"
-        f"Первое сообщение: `{oldest_s}`\n"
-        f"Последнее:        `{newest_s}`"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text(get_stats_text(), parse_mode="Markdown", reply_markup=main_kb())
 
 # ── /chats ────────────────────────────────────────────────────────────────────
 async def cmd_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private": return
     if not is_admin(update): return await deny(update)
-
-    with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT chat_id, chat_title, COUNT(*) as cnt,
-                      MAX(date) as last
-               FROM messages
-               GROUP BY chat_id
-               ORDER BY cnt DESC"""
-        ).fetchall()
-
-    if not rows:
-        return await update.message.reply_text("Нет данных. Добавь бота в чаты.")
-
-    lines = ["💬 *Отслеживаемые чаты*\n"]
-    for r in rows:
-        title = r["chat_title"] or "—"
-        last  = ts_to_local(r["last"]) if r["last"] else "—"
-        lines.append(
-            f"*{title}*\n"
-            f"  ID: `{r['chat_id']}`\n"
-            f"  Сообщений: `{r['cnt']:,}` | Последнее: `{last}`"
-        )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text(get_chats_text(), parse_mode="Markdown", reply_markup=main_kb())
 
 # ── /topusers ─────────────────────────────────────────────────────────────────
 async def cmd_topusers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private": return
     if not is_admin(update): return await deny(update)
-
     n = 10
     if ctx.args:
         try: n = max(1, min(50, int(ctx.args[0])))
         except ValueError: pass
+    await update.message.reply_text(get_topusers_text(n), parse_mode="Markdown", reply_markup=main_kb())
 
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"""SELECT user_id, username, full_name,
-                       COUNT(*) as cnt,
-                       COUNT(DISTINCT chat_id) as chats
-                FROM messages
-                WHERE user_id IS NOT NULL
-                GROUP BY user_id
-                ORDER BY cnt DESC
-                LIMIT {n}"""
-        ).fetchall()
-
-    if not rows:
-        return await update.message.reply_text("Нет данных.")
-
-    lines = [f"🏆 *Топ {n} активных участников*\n"]
-    for i, r in enumerate(rows, 1):
-        name = r["full_name"] or r["username"] or str(r["user_id"])
-        uname = f"@{r['username']}" if r["username"] else f"`{r['user_id']}`"
-        lines.append(f"{i}. {name} ({uname})\n   Сообщений: `{r['cnt']:,}` в `{r['chats']}` чатах")
-
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
-
-# ── /recent ───────────────────────────────────────────────────────────────────
 async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private": return
     if not is_admin(update): return await deny(update)
-
     n = 20
     if ctx.args:
         try: n = max(1, min(50, int(ctx.args[0])))
         except ValueError: pass
-
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"""SELECT chat_title, full_name, username, text,
-                       media_type, date
-                FROM messages
-                ORDER BY date DESC
-                LIMIT {n}"""
-        ).fetchall()
-
-    if not rows:
-        return await update.message.reply_text("Нет сообщений.")
-
-    lines = [f"🕐 *Последние {n} сообщений*\n"]
-    for r in rows:
-        who   = r["full_name"] or r["username"] or "?"
-        chat  = r["chat_title"] or "?"
-        ts    = ts_to_local(r["date"])
-        body  = r["text"] or f"[{r['media_type'] or 'медиа'}]"
-        body  = body[:120] + ("…" if len(body) > 120 else "")
-        lines.append(f"`{ts}` [{chat}] *{who}*:\n{body}")
-
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(get_recent_text(n), parse_mode="Markdown")
 
 # ── /find ─────────────────────────────────────────────────────────────────────
 async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -450,16 +431,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("⛔ Нет доступа", show_alert=True)
         return
 
-    # Reuse command handlers by faking update type
-    fake = update
-    if q.data == "cb_stats":
-        await cmd_stats(fake, ctx)
-    elif q.data == "cb_chats":
-        await cmd_chats(fake, ctx)
-    elif q.data == "cb_topusers":
-        await cmd_topusers(fake, ctx)
-    elif q.data == "cb_recent":
-        await cmd_recent(fake, ctx)
+    chat_id = q.message.chat_id
+
+    dispatch = {
+        "cb_stats":    (get_stats_text,    "📊"),
+        "cb_chats":    (get_chats_text,    "💬"),
+        "cb_topusers": (get_topusers_text, "🏆"),
+        "cb_recent":   (get_recent_text,   "🕐"),
+    }
+    if q.data in dispatch:
+        fn, _ = dispatch[q.data]
+        text = fn()
+        await ctx.bot.send_message(chat_id=chat_id, text=text,
+                                   parse_mode="Markdown", reply_markup=main_kb())
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
