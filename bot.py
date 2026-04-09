@@ -1,7 +1,7 @@
 import os
-import sqlite3
 import re
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,470 +9,317 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TOKEN        = os.environ["BOT_TOKEN"]
-ADMIN_IDS    = set(
+TOKEN     = os.environ["BOT_TOKEN"]
+ADMIN_IDS = set(
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip()
 )
-TZ           = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Almaty"))
-DB_PATH      = os.environ.get("DB_PATH", "/data/monitor.db")
+TZ       = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Almaty"))
+DB_PATH  = os.environ.get("DB_PATH", "/data/monitor.db")
 
-# ── DB ────────────────────────────────────────────────────────────────────────
+CHAT_DEPLOY = "Забрали готовые СЦ"
+CHAT_RETURN = "Привезли на ремонт ТС"
+EARLY_THRESHOLDS = [7, 14, 21]
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with get_conn() as conn:
         conn.executescript("""
-        CREATE TABLE IF NOT EXISTS messages (
+        CREATE TABLE IF NOT EXISTS events (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER NOT NULL,
+            scooter_id  TEXT NOT NULL,
+            evin        TEXT,
+            model       TEXT,
+            event_type  TEXT NOT NULL,
             chat_title  TEXT,
-            chat_type   TEXT,
-            msg_id      INTEGER,
-            user_id     INTEGER,
-            username    TEXT,
-            full_name   TEXT,
-            text        TEXT,
-            has_media   INTEGER DEFAULT 0,
-            media_type  TEXT,
+            chat_id     INTEGER,
+            operator    TEXT,
             date        INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_chat   ON messages(chat_id);
-        CREATE INDEX IF NOT EXISTS idx_date   ON messages(date);
-        CREATE INDEX IF NOT EXISTS idx_user   ON messages(user_id);
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-            USING fts5(text, content=messages, content_rowid=id);
-        CREATE TRIGGER IF NOT EXISTS msg_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
-        END;
+        CREATE INDEX IF NOT EXISTS idx_scooter ON events(scooter_id);
+        CREATE INDEX IF NOT EXISTS idx_date    ON events(date);
+        CREATE INDEX IF NOT EXISTS idx_type    ON events(event_type);
         """)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def now_local() -> datetime:
-    return datetime.now(TZ)
-
-def ts_to_local(ts: int) -> str:
+def ts_to_local(ts):
     return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
 
-def is_admin(update: Update) -> bool:
+def today_start():
+    return int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+def is_admin(update):
     uid = update.effective_user.id
     return not ADMIN_IDS or uid in ADMIN_IDS
 
-async def deny(update: Update):
-    await update.message.reply_text("⛔ Нет доступа.")
+async def deny(update):
+    txt = "⛔ Нет доступа."
+    if update.callback_query:
+        await update.callback_query.answer(txt, show_alert=True)
+    else:
+        await update.message.reply_text(txt)
 
-def main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Общая стата",   callback_data="cb_stats"),
-         InlineKeyboardButton("💬 По чатам",      callback_data="cb_chats")],
-        [InlineKeyboardButton("🏆 Топ юзеров",    callback_data="cb_topusers"),
-         InlineKeyboardButton("🕐 Последние",     callback_data="cb_recent")],
-    ])
+SCOOTER_RE = re.compile(r'S\.(\d+)', re.IGNORECASE)
+EVIN_RE    = re.compile(r'eVin[:\s]+(\d+)', re.IGNORECASE)
+MODEL_RE   = re.compile(r'(Ninebot[^\n,]+|Segway[^\n,]+)', re.IGNORECASE)
 
-# ── Message collector ─────────────────────────────────────────────────────────
-async def collect_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Saves every group/channel message to DB."""
-    msg = update.effective_message
-    if not msg:
-        return
+def parse_scooters(text):
+    results = []
+    for m in SCOOTER_RE.finditer(text):
+        sid     = m.group(1)
+        snippet = text[m.start():m.start()+80]
+        evin_m  = EVIN_RE.search(snippet)
+        model_m = MODEL_RE.search(snippet)
+        results.append({
+            "scooter_id": sid,
+            "evin":  evin_m.group(1) if evin_m else None,
+            "model": model_m.group(1).strip() if model_m else None,
+        })
+    return results
+
+def detect_event_type(chat_title):
+    if CHAT_DEPLOY in chat_title:
+        return "deploy"
+    if CHAT_RETURN in chat_title:
+        return "return"
+    return None
+
+async def collect_message(update, ctx):
+    msg  = update.effective_message
     chat = update.effective_chat
-    if chat.type not in ("group", "supergroup", "channel"):
+    if not msg or not chat:
         return
-
-    user    = update.effective_user
-    uid     = user.id     if user else None
-    uname   = user.username  if user else None
-    fname   = user.full_name if user else None
-
+    if chat.type not in ("group", "supergroup"):
+        return
+    event_type = detect_event_type(chat.title or "")
+    if not event_type:
+        return
     text = msg.text or msg.caption or ""
-
-    media_type = None
-    if msg.photo:        media_type = "photo"
-    elif msg.video:      media_type = "video"
-    elif msg.document:   media_type = "document"
-    elif msg.audio:      media_type = "audio"
-    elif msg.voice:      media_type = "voice"
-    elif msg.sticker:    media_type = "sticker"
-    elif msg.animation:  media_type = "animation"
-
-    ts = int(msg.date.timestamp())
-
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO messages
-               (chat_id, chat_title, chat_type, msg_id,
-                user_id, username, full_name, text,
-                has_media, media_type, date)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (chat.id, chat.title, chat.type, msg.message_id,
-             uid, uname, fname, text,
-             1 if media_type else 0, media_type, ts)
-        )
-
-# ── Text builders (используются и командами и кнопками) ──────────────────────
-def get_stats_text() -> str:
-    with get_conn() as conn:
-        total  = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        chats  = conn.execute("SELECT COUNT(DISTINCT chat_id) FROM messages").fetchone()[0]
-        users  = conn.execute("SELECT COUNT(DISTINCT user_id) FROM messages WHERE user_id IS NOT NULL").fetchone()[0]
-        media  = conn.execute("SELECT COUNT(*) FROM messages WHERE has_media=1").fetchone()[0]
-        today_start = int(datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
-        today  = conn.execute("SELECT COUNT(*) FROM messages WHERE date>=?", (today_start,)).fetchone()[0]
-        oldest = conn.execute("SELECT MIN(date) FROM messages").fetchone()[0]
-        newest = conn.execute("SELECT MAX(date) FROM messages").fetchone()[0]
-    oldest_s = ts_to_local(oldest) if oldest else "—"
-    newest_s = ts_to_local(newest) if newest else "—"
-    return (
-        f"📊 *Общая статистика*\n\n"
-        f"Всего сообщений: `{total:,}`\n"
-        f"Из них сегодня:  `{today:,}`\n"
-        f"С медиафайлом:   `{media:,}`\n"
-        f"Чатов:           `{chats}`\n"
-        f"Уникальных юзеров: `{users}`\n\n"
-        f"Первое сообщение: `{oldest_s}`\n"
-        f"Последнее:        `{newest_s}`"
-    )
-
-def get_chats_text() -> str:
-    with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT chat_id, chat_title, COUNT(*) as cnt, MAX(date) as last
-               FROM messages GROUP BY chat_id ORDER BY cnt DESC"""
-        ).fetchall()
-    if not rows:
-        return "Нет данных. Добавь бота в чаты."
-    lines = ["💬 *Отслеживаемые чаты*\n"]
-    for r in rows:
-        title = r["chat_title"] or "—"
-        last  = ts_to_local(r["last"]) if r["last"] else "—"
-        lines.append(f"*{title}*\n  ID: `{r['chat_id']}`\n  Сообщений: `{r['cnt']:,}` | Последнее: `{last}`")
-    return "\n\n".join(lines)
-
-def get_topusers_text(n: int = 10) -> str:
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"""SELECT user_id, username, full_name, COUNT(*) as cnt,
-                       COUNT(DISTINCT chat_id) as chats
-                FROM messages WHERE user_id IS NOT NULL
-                GROUP BY user_id ORDER BY cnt DESC LIMIT {n}"""
-        ).fetchall()
-    if not rows:
-        return "Нет данных."
-    lines = [f"🏆 *Топ {n} активных участников*\n"]
-    for i, r in enumerate(rows, 1):
-        name  = r["full_name"] or r["username"] or str(r["user_id"])
-        uname = f"@{r['username']}" if r["username"] else f"`{r['user_id']}`"
-        lines.append(f"{i}. {name} ({uname})\n   Сообщений: `{r['cnt']:,}` в `{r['chats']}` чатах")
-    return "\n\n".join(lines)
-
-def get_recent_text(n: int = 20) -> str:
-    with get_conn() as conn:
-        rows = conn.execute(
-            f"""SELECT chat_title, full_name, username, text, media_type, date
-                FROM messages ORDER BY date DESC LIMIT {n}"""
-        ).fetchall()
-    if not rows:
-        return "Нет сообщений."
-    lines = [f"🕐 *Последние {n} сообщений*\n"]
-    for r in rows:
-        who  = r["full_name"] or r["username"] or "?"
-        chat = r["chat_title"] or "?"
-        ts   = ts_to_local(r["date"])
-        body = r["text"] or f"[{r['media_type'] or 'медиа'}]"
-        body = body[:120] + ("…" if len(body) > 120 else "")
-        lines.append(f"`{ts}` [{chat}] *{who}*:\n{body}")
-    return "\n\n".join(lines)
-
-# ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
+    if not text:
         return
-    if not is_admin(update): return await deny(update)
-    await update.message.reply_text(
-        "👋 *Монитор чатов*\n\n"
-        "Добавь меня в нужные группы — я буду логировать все сообщения.\n\n"
-        "Команды для лички:\n"
-        "/stats — общая статистика\n"
-        "/chats — список отслеживаемых чатов\n"
-        "/topusers — топ активных участников\n"
-        "/recent `[N]` — последние N сообщений (по умолч. 20)\n"
-        "/find `<текст>` — полнотекстовый поиск\n"
-        "/chatlog `<chat_id>` `[N]` — лог конкретного чата\n"
-        "/userstats `<@username или user_id>` — стата по юзеру\n"
-        "/help — справка",
-        parse_mode="Markdown",
-        reply_markup=main_kb(),
-    )
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-    await update.message.reply_text(
-        "📖 *Команды*\n\n"
-        "`/stats` — общая статистика по всем чатам\n"
-        "`/chats` — список чатов с кол-вом сообщений\n"
-        "`/topusers [N]` — топ N юзеров (по умолч. 10)\n"
-        "`/recent [N]` — последние N сообщений (по умолч. 20)\n"
-        "`/find <текст>` — полнотекстовый поиск\n"
-        "`/chatlog <chat_id> [N]` — лог чата (N последних)\n"
-        "`/userstats <@username|user_id>` — статистика юзера\n"
-        "`/today` — сообщения за сегодня\n"
-        "`/help` — эта справка",
-        parse_mode="Markdown",
-    )
-
-# ── /stats ────────────────────────────────────────────────────────────────────
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-    await update.message.reply_text(get_stats_text(), parse_mode="Markdown", reply_markup=main_kb())
-
-# ── /chats ────────────────────────────────────────────────────────────────────
-async def cmd_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-    await update.message.reply_text(get_chats_text(), parse_mode="Markdown", reply_markup=main_kb())
-
-# ── /topusers ─────────────────────────────────────────────────────────────────
-async def cmd_topusers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-    n = 10
-    if ctx.args:
-        try: n = max(1, min(50, int(ctx.args[0])))
-        except ValueError: pass
-    await update.message.reply_text(get_topusers_text(n), parse_mode="Markdown", reply_markup=main_kb())
-
-async def cmd_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-    n = 20
-    if ctx.args:
-        try: n = max(1, min(50, int(ctx.args[0])))
-        except ValueError: pass
-    await update.message.reply_text(get_recent_text(n), parse_mode="Markdown")
-
-# ── /find ─────────────────────────────────────────────────────────────────────
-async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-
-    if not ctx.args:
-        return await update.message.reply_text("Использование: `/find <текст>`", parse_mode="Markdown")
-
-    query = " ".join(ctx.args)
-
+    scooters = parse_scooters(text)
+    if not scooters:
+        return
+    operator = msg.from_user.full_name if msg.from_user else None
+    ts = int(msg.date.timestamp())
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT m.chat_title, m.full_name, m.username,
-                      m.text, m.date, m.chat_id
-               FROM messages_fts fts
-               JOIN messages m ON fts.rowid = m.id
-               WHERE messages_fts MATCH ?
-               ORDER BY m.date DESC
-               LIMIT 30""",
-            (query,)
-        ).fetchall()
+        for sc in scooters:
+            conn.execute(
+                "INSERT INTO events (scooter_id,evin,model,event_type,chat_title,chat_id,operator,date) VALUES (?,?,?,?,?,?,?,?)",
+                (sc["scooter_id"], sc["evin"], sc["model"], event_type, chat.title, chat.id, operator, ts)
+            )
 
-    if not rows:
-        return await update.message.reply_text(f"🔍 По запросу «{query}» ничего не найдено.")
-
-    lines = [f"🔍 *Найдено {len(rows)} сообщений по «{query}»*\n"]
-    for r in rows:
-        who  = r["full_name"] or r["username"] or "?"
-        chat = r["chat_title"] or str(r["chat_id"])
-        ts   = ts_to_local(r["date"])
-        body = r["text"] or ""
-        # highlight match (simple)
-        body = body[:200] + ("…" if len(body) > 200 else "")
-        lines.append(f"`{ts}` [{chat}] *{who}*:\n{body}")
-
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
-
-# ── /chatlog ──────────────────────────────────────────────────────────────────
-async def cmd_chatlog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-
-    if not ctx.args:
-        return await update.message.reply_text(
-            "Использование: `/chatlog <chat_id> [N]`\n"
-            "chat_id узнай через /chats", parse_mode="Markdown"
-        )
-
-    try:
-        chat_id = int(ctx.args[0])
-    except ValueError:
-        return await update.message.reply_text("chat_id должен быть числом.")
-
-    n = 30
-    if len(ctx.args) > 1:
-        try: n = max(1, min(100, int(ctx.args[1])))
-        except ValueError: pass
-
+def get_deployed_today():
+    ts = today_start()
     with get_conn() as conn:
-        info = conn.execute(
-            "SELECT chat_title FROM messages WHERE chat_id=? LIMIT 1", (chat_id,)
-        ).fetchone()
-        rows = conn.execute(
-            """SELECT full_name, username, text, media_type, date
-               FROM messages WHERE chat_id=?
-               ORDER BY date DESC LIMIT ?""",
-            (chat_id, n)
-        ).fetchall()
-
-    if not rows:
-        return await update.message.reply_text("Нет сообщений для этого чата.")
-
-    title = info["chat_title"] if info else str(chat_id)
-    lines = [f"📜 *Лог чата «{title}»* (последние {n})\n"]
-    for r in reversed(rows):
-        who  = r["full_name"] or r["username"] or "?"
-        ts   = ts_to_local(r["date"])
-        body = r["text"] or f"[{r['media_type'] or 'медиа'}]"
-        body = body[:150] + ("…" if len(body) > 150 else "")
-        lines.append(f"`{ts}` *{who}*: {body}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-# ── /userstats ────────────────────────────────────────────────────────────────
-async def cmd_userstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-
-    if not ctx.args:
-        return await update.message.reply_text(
-            "Использование: `/userstats <@username или user_id>`", parse_mode="Markdown"
-        )
-
-    arg = ctx.args[0].lstrip("@")
-    with get_conn() as conn:
-        # try username first, then user_id
-        if arg.isdigit():
-            rows = conn.execute(
-                "SELECT * FROM messages WHERE user_id=? ORDER BY date DESC", (int(arg),)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM messages WHERE username=? ORDER BY date DESC", (arg,)
-            ).fetchall()
-
-    if not rows:
-        return await update.message.reply_text("Пользователь не найден в базе.")
-
-    r0 = rows[0]
-    name  = r0["full_name"] or r0["username"] or str(r0["user_id"])
-    uname = f"@{r0['username']}" if r0["username"] else "—"
-    total = len(rows)
-    media = sum(1 for r in rows if r["has_media"])
-    chats = len(set(r["chat_id"] for r in rows))
-    first = ts_to_local(rows[-1]["date"])
-    last  = ts_to_local(rows[0]["date"])
-
-    # top chats for this user
-    from collections import Counter
-    chat_cnt = Counter((r["chat_id"], r["chat_title"]) for r in rows)
-    top_chats = "\n".join(
-        f"  • {t or str(cid)}: {cnt}"
-        for (cid, t), cnt in chat_cnt.most_common(5)
-    )
-
-    text = (
-        f"👤 *{name}* ({uname})\n"
-        f"ID: `{r0['user_id']}`\n\n"
-        f"Всего сообщений: `{total:,}`\n"
-        f"С медиа: `{media}`\n"
-        f"Чатов: `{chats}`\n"
-        f"Первое: `{first}`\n"
-        f"Последнее: `{last}`\n\n"
-        f"*Активность по чатам:*\n{top_chats}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# ── /today ────────────────────────────────────────────────────────────────────
-async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private": return
-    if not is_admin(update): return await deny(update)
-
-    today_start = int(datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
-    with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT chat_id, chat_title, COUNT(*) as cnt,
-                      COUNT(DISTINCT user_id) as users
-               FROM messages WHERE date >= ?
-               GROUP BY chat_id ORDER BY cnt DESC""",
-            (today_start,)
-        ).fetchall()
-        total = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE date>=?", (today_start,)
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='deploy' AND date>=?", (ts,)
         ).fetchone()[0]
+    today_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    if cnt == 0:
+        return f"🛴 *Выехали в поле сегодня ({today_str})*\n\nНет данных."
+    return f"🛴 *Выехали в поле сегодня ({today_str})*\n\n`{cnt}` самокатов выехало в поле."
 
-    if not rows:
-        return await update.message.reply_text("Сегодня сообщений нет.")
+def get_returned_today():
+    ts = today_start()
+    with get_conn() as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='return' AND date>=?", (ts,)
+        ).fetchone()[0]
+    today_str = datetime.now(TZ).strftime("%d.%m.%Y")
+    if cnt == 0:
+        return f"🔧 *Привезли на СЦ сегодня ({today_str})*\n\nНет данных."
+    return f"🔧 *Привезли на СЦ сегодня ({today_str})*\n\n`{cnt}` самокатов привезли на СЦ."
+
+def get_early_returns():
+    with get_conn() as conn:
+        returns = conn.execute(
+            "SELECT scooter_id, date FROM events WHERE event_type='return' ORDER BY date DESC"
+        ).fetchall()
+
+    buckets = {7: [], 14: [], 21: []}
+    for ret in returns:
+        sid = ret["scooter_id"]
+        ret_ts = ret["date"]
+        with get_conn() as conn:
+            dep = conn.execute(
+                "SELECT date FROM events WHERE scooter_id=? AND event_type='deploy' AND date<? ORDER BY date DESC LIMIT 1",
+                (sid, ret_ts)
+            ).fetchone()
+        if not dep:
+            continue
+        days_out = (ret_ts - dep["date"]) / 86400
+        for threshold in EARLY_THRESHOLDS:
+            if days_out < threshold:
+                buckets[threshold].append({
+                    "sid": sid, "days": days_out,
+                    "deploy_ts": dep["date"], "return_ts": ret_ts,
+                })
+                break
+
+    lines = ["⚠️ *Ранние возвраты самокатов*\n"]
+    total = 0
+    for threshold in EARLY_THRESHOLDS:
+        group = buckets[threshold]
+        if not group:
+            continue
+        lines.append(f"*До {threshold} дней* — {len(group)} шт.")
+        for item in group:
+            lines.append(
+                f"  `S.{item['sid']}` — выехал {ts_to_local(item['deploy_ts'])}, "
+                f"вернулся {ts_to_local(item['return_ts'])} "
+                f"(спустя *{item['days']:.0f} дн.*) ⚠️"
+            )
+        total += len(group)
+        lines.append("")
+    if total == 0:
+        return "⚠️ *Ранние возвраты*\n\nНет ранних возвратов. Всё в норме ✅"
+    lines.append(f"Итого: `{total}` самокатов")
+    return "\n".join(lines)
+
+def get_summary():
+    ts = today_start()
+    with get_conn() as conn:
+        dep_today = conn.execute("SELECT COUNT(*) FROM events WHERE event_type='deploy' AND date>=?", (ts,)).fetchone()[0]
+        ret_today = conn.execute("SELECT COUNT(*) FROM events WHERE event_type='return' AND date>=?", (ts,)).fetchone()[0]
+        dep_total = conn.execute("SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='deploy'").fetchone()[0]
+        ret_total = conn.execute("SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='return'").fetchone()[0]
+        returns   = conn.execute("SELECT scooter_id, date FROM events WHERE event_type='return'").fetchall()
+
+    early = 0
+    for ret in returns:
+        with get_conn() as conn:
+            dep = conn.execute(
+                "SELECT date FROM events WHERE scooter_id=? AND event_type='deploy' AND date<? ORDER BY date DESC LIMIT 1",
+                (ret["scooter_id"], ret["date"])
+            ).fetchone()
+        if dep and (ret["date"] - dep["date"]) / 86400 < 21:
+            early += 1
 
     today_str = datetime.now(TZ).strftime("%d.%m.%Y")
-    lines = [f"📅 *Сегодня ({today_str})* — всего `{total}` сообщений\n"]
-    for r in rows:
-        title = r["chat_title"] or str(r["chat_id"])
-        lines.append(f"• {title}: `{r['cnt']}` сообщ., `{r['users']}` юзеров")
+    return (
+        f"📋 *Сводка на {today_str}*\n\n"
+        f"🛴 Выехали в поле сегодня:    `{dep_today}`\n"
+        f"🔧 Привезли на СЦ сегодня:    `{ret_today}`\n\n"
+        f"📦 Всего выездов (уник.):      `{dep_total}`\n"
+        f"📥 Всего возвратов (уник.):    `{ret_total}`\n\n"
+        f"⚠️ Ранних возвратов (<21 дн.): `{early}`"
+    )
 
+def main_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛴 Выехали сегодня",  callback_data="deployed"),
+         InlineKeyboardButton("🔧 Привезли сегодня", callback_data="returned")],
+        [InlineKeyboardButton("⚠️ Ранние возвраты",  callback_data="early")],
+        [InlineKeyboardButton("📋 Общая сводка",     callback_data="summary")],
+    ])
+
+async def cmd_start(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    await update.message.reply_text(
+        "👋 *JetMir Ops Bot*\n\n"
+        "Отслеживаю самокаты по чатам:\n"
+        f"• {CHAT_DEPLOY} | Алматы\n"
+        f"• {CHAT_RETURN} | Алматы\n\n"
+        "/deployed — выехали в поле сегодня\n"
+        "/returned — привезли на СЦ сегодня\n"
+        "/early — ранние возвраты (<7/14/21 дн.)\n"
+        "/summary — общая сводка\n"
+        "/find 255022 — история самоката",
+        parse_mode="Markdown", reply_markup=main_kb()
+    )
+
+async def cmd_deployed(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    await update.message.reply_text(get_deployed_today(), parse_mode="Markdown", reply_markup=main_kb())
+
+async def cmd_returned(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    await update.message.reply_text(get_returned_today(), parse_mode="Markdown", reply_markup=main_kb())
+
+async def cmd_early(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    await update.message.reply_text(get_early_returns(), parse_mode="Markdown", reply_markup=main_kb())
+
+async def cmd_summary(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    await update.message.reply_text(get_summary(), parse_mode="Markdown", reply_markup=main_kb())
+
+async def cmd_find(update, ctx):
+    if update.effective_chat.type != "private": return
+    if not is_admin(update): return await deny(update)
+    if not ctx.args:
+        return await update.message.reply_text("Использование: `/find 255022`", parse_mode="Markdown")
+    raw = ctx.args[0].lstrip("Ss.")
+    if not raw.isdigit():
+        return await update.message.reply_text("Введи номер: `/find 255022`", parse_mode="Markdown")
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_type, operator, date FROM events WHERE scooter_id=? ORDER BY date ASC", (raw,)
+        ).fetchall()
+    if not rows:
+        return await update.message.reply_text(f"Самокат `S.{raw}` не найден.", parse_mode="Markdown")
+    lines = [f"🔍 *История S.{raw}*\n"]
+    prev_dep = None
+    for r in rows:
+        t    = ts_to_local(r["date"])
+        op   = r["operator"] or "?"
+        if r["event_type"] == "deploy":
+            prev_dep = r["date"]
+            lines.append(f"🛴 Выехал в поле: `{t}` | {op}")
+        else:
+            if prev_dep:
+                days = (r["date"] - prev_dep) / 86400
+                warn = " ⚠️ РАННИЙ ВОЗВРАТ" if days < 7 else (" ⚠️" if days < 14 else "")
+                lines.append(f"🔧 Вернулся на СЦ: `{t}` | {op} (в поле: *{days:.0f} дн.*){warn}")
+            else:
+                lines.append(f"🔧 Вернулся на СЦ: `{t}` | {op}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
 
-# ── Callback buttons ──────────────────────────────────────────────────────────
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+CALLBACK_MAP = {
+    "deployed": get_deployed_today,
+    "returned": get_returned_today,
+    "early":    get_early_returns,
+    "summary":  get_summary,
+}
+
+async def on_callback(update, ctx):
     q = update.callback_query
     await q.answer()
     if not is_admin(update):
         await q.answer("⛔ Нет доступа", show_alert=True)
         return
+    fn = CALLBACK_MAP.get(q.data)
+    if fn:
+        await ctx.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=fn(),
+            parse_mode="Markdown",
+            reply_markup=main_kb()
+        )
 
-    chat_id = q.message.chat_id
-
-    dispatch = {
-        "cb_stats":    (get_stats_text,    "📊"),
-        "cb_chats":    (get_chats_text,    "💬"),
-        "cb_topusers": (get_topusers_text, "🏆"),
-        "cb_recent":   (get_recent_text,   "🕐"),
-    }
-    if q.data in dispatch:
-        fn, _ = dispatch[q.data]
-        text = fn()
-        await ctx.bot.send_message(chat_id=chat_id, text=text,
-                                   parse_mode="Markdown", reply_markup=main_kb())
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    import os
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     init_db()
-
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Collector — catches ALL messages in groups/channels
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS | filters.ChatType.CHANNEL,
-        collect_message
-    ), group=0)
-
-    # Commands — only respond in private chat
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("stats",     cmd_stats))
-    app.add_handler(CommandHandler("chats",     cmd_chats))
-    app.add_handler(CommandHandler("topusers",  cmd_topusers))
-    app.add_handler(CommandHandler("recent",    cmd_recent))
-    app.add_handler(CommandHandler("find",      cmd_find))
-    app.add_handler(CommandHandler("chatlog",   cmd_chatlog))
-    app.add_handler(CommandHandler("userstats", cmd_userstats))
-    app.add_handler(CommandHandler("today",     cmd_today))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, collect_message), group=0)
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("deployed", cmd_deployed))
+    app.add_handler(CommandHandler("returned", cmd_returned))
+    app.add_handler(CommandHandler("early",    cmd_early))
+    app.add_handler(CommandHandler("summary",  cmd_summary))
+    app.add_handler(CommandHandler("find",     cmd_find))
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    print("🤖 Chat monitor bot started")
+    print("🤖 JetMir Ops Bot started")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
