@@ -42,7 +42,9 @@ def init_db():
             chat_title  TEXT,
             chat_id     INTEGER,
             operator    TEXT,
-            date        INTEGER NOT NULL
+            date        INTEGER NOT NULL,
+            message_id  INTEGER,
+            UNIQUE(message_id, chat_id, scooter_id, event_type)
         );
         CREATE INDEX IF NOT EXISTS idx_scooter ON events(scooter_id);
         CREATE INDEX IF NOT EXISTS idx_date    ON events(date);
@@ -93,9 +95,14 @@ EVIN_RE    = re.compile(r'eVin[:\s]+(\d+)', re.IGNORECASE)
 MODEL_RE   = re.compile(r'(Ninebot[^\n,]+|Segway[^\n,]+)', re.IGNORECASE)
 
 def parse_scooters(text):
+    # FIX 1: дедупликация — один самокат из одного сообщения считается один раз
+    seen = set()
     results = []
     for m in SCOOTER_RE.finditer(text):
-        sid     = m.group(1)
+        sid = m.group(1)
+        if sid in seen:
+            continue
+        seen.add(sid)
         snippet = text[m.start():m.start()+80]
         evin_m  = EVIN_RE.search(snippet)
         model_m = MODEL_RE.search(snippet)
@@ -131,11 +138,17 @@ async def collect_message(update, ctx):
         return
     operator = msg.from_user.full_name if msg.from_user else None
     ts = int(msg.date.timestamp())
+    msg_id = msg.message_id
+
     with get_conn() as conn:
         for sc in scooters:
+            # FIX 2: INSERT OR IGNORE защищает от дублей при рестарте / редактировании
             conn.execute(
-                "INSERT INTO events (scooter_id,evin,model,event_type,chat_title,chat_id,operator,date) VALUES (?,?,?,?,?,?,?,?)",
-                (sc["scooter_id"], sc["evin"], sc["model"], event_type, chat.title, chat.id, operator, ts)
+                """INSERT OR IGNORE INTO events
+                   (scooter_id, evin, model, event_type, chat_title, chat_id, operator, date, message_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (sc["scooter_id"], sc["evin"], sc["model"],
+                 event_type, chat.title, chat.id, operator, ts, msg_id)
             )
 
 def label_for_range(start_ts, end_ts):
@@ -153,8 +166,9 @@ def label_for_range(start_ts, end_ts):
 def get_deployed(start_ts, end_ts):
     lbl = label_for_range(start_ts, end_ts)
     with get_conn() as conn:
+        # FIX 3: COUNT(DISTINCT) чтобы один самокат не считался дважды
         cnt = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE event_type='deploy' AND date>=? AND date<=?",
+            "SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='deploy' AND date>=? AND date<=?",
             (start_ts, end_ts)
         ).fetchone()[0]
     if cnt == 0:
@@ -164,8 +178,9 @@ def get_deployed(start_ts, end_ts):
 def get_returned(start_ts, end_ts):
     lbl = label_for_range(start_ts, end_ts)
     with get_conn() as conn:
+        # FIX 3: COUNT(DISTINCT) чтобы один самокат не считался дважды
         cnt = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE event_type='return' AND date>=? AND date<=?",
+            "SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='return' AND date>=? AND date<=?",
             (start_ts, end_ts)
         ).fetchone()[0]
     if cnt == 0:
