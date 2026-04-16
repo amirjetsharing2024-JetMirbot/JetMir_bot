@@ -43,13 +43,25 @@ def init_db():
             chat_id     INTEGER,
             operator    TEXT,
             date        INTEGER NOT NULL,
-            message_id  INTEGER,
-            UNIQUE(message_id, chat_id, scooter_id, event_type)
+            message_id  INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_scooter ON events(scooter_id);
         CREATE INDEX IF NOT EXISTS idx_date    ON events(date);
         CREATE INDEX IF NOT EXISTS idx_type    ON events(event_type);
         """)
+        # Миграция: добавляем message_id если его нет в старой базе
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN message_id INTEGER")
+        except Exception:
+            pass  # колонка уже есть — всё ок
+        # Миграция: добавляем уникальный индекс если его нет
+        try:
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_event
+                ON events(message_id, chat_id, scooter_id, event_type)
+            """)
+        except Exception:
+            pass
 
 def ts_to_local(ts):
     return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
@@ -95,7 +107,6 @@ EVIN_RE    = re.compile(r'eVin[:\s]+(\d+)', re.IGNORECASE)
 MODEL_RE   = re.compile(r'(Ninebot[^\n,]+|Segway[^\n,]+)', re.IGNORECASE)
 
 def parse_scooters(text):
-    # FIX 1: дедупликация — один самокат из одного сообщения считается один раз
     seen = set()
     results = []
     for m in SCOOTER_RE.finditer(text):
@@ -142,7 +153,6 @@ async def collect_message(update, ctx):
 
     with get_conn() as conn:
         for sc in scooters:
-            # FIX 2: INSERT OR IGNORE защищает от дублей при рестарте / редактировании
             conn.execute(
                 """INSERT OR IGNORE INTO events
                    (scooter_id, evin, model, event_type, chat_title, chat_id, operator, date, message_id)
@@ -166,7 +176,6 @@ def label_for_range(start_ts, end_ts):
 def get_deployed(start_ts, end_ts):
     lbl = label_for_range(start_ts, end_ts)
     with get_conn() as conn:
-        # FIX 3: COUNT(DISTINCT) чтобы один самокат не считался дважды
         cnt = conn.execute(
             "SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='deploy' AND date>=? AND date<=?",
             (start_ts, end_ts)
@@ -178,7 +187,6 @@ def get_deployed(start_ts, end_ts):
 def get_returned(start_ts, end_ts):
     lbl = label_for_range(start_ts, end_ts)
     with get_conn() as conn:
-        # FIX 3: COUNT(DISTINCT) чтобы один самокат не считался дважды
         cnt = conn.execute(
             "SELECT COUNT(DISTINCT scooter_id) FROM events WHERE event_type='return' AND date>=? AND date<=?",
             (start_ts, end_ts)
